@@ -6,7 +6,9 @@
  */
 #include "spp.h"
 
-#include <ilcplex/ilocplex.h>
+#include "gurobi_c++.h"
+
+#include <cassert>
 
 #include <algorithm>
 #include <list>
@@ -137,31 +139,27 @@ double StripPacking::solve(
   std::set<int> allPositions;
   for (const auto& it : t_mapPosWidth)
     for (const auto& it2 : it.second) allPositions.insert(it2);
-  IloEnv env;
-  IloModel model(env);
-  std::map<std::string, IloNumVar> allVars;
+  GRBEnv env(true);
+  env.set(GRB_IntParam_OutputFlag, 0);
+  env.start();
+  GRBModel model(env);
+  std::map<std::string, GRBVar> allVars;
   // first constraints set
   for (const auto& it : t_allItems) {
-    IloExpr expr(env);
+    GRBLinExpr expr;
     for (const auto& it2 : t_mapPosWidth.find(it->idx)->second) {
       auto varName = StripPacking::getVarName(it->idx, it2);
-      if (t_Integer) {
-        IloNumVar var(env, 0, 1, ILOINT, varName.c_str());
-        allVars.insert(std::pair<std::string, IloNumVar>(varName, var));
-        expr += var;
-      } else {
-        IloNumVar var(env, 0, 1, ILOFLOAT, varName.c_str());
-        allVars.insert(std::pair<std::string, IloNumVar>(varName, var));
-        expr += var;
-      }
+      char varType = t_Integer ? GRB_INTEGER : GRB_CONTINUOUS;
+      GRBVar var = model.addVar(0.0, 1.0, 0.0, varType, varName);
+      allVars.insert(std::pair<std::string, GRBVar>(varName, var));
+      expr += var;
     }
-    model.add(expr == 1);
-    expr.end();
+    model.addConstr(expr == 1);
   }
   // second constraints set
-  IloNumVar z(env, 0, IloInfinity, "ObjZ");
+  GRBVar z = model.addVar(0.0, GRB_INFINITY, 0.0, GRB_CONTINUOUS, "ObjZ");
   for (const auto q : allPositions) {
-    IloExpr expr(env);
+    GRBLinExpr expr;
     for (const auto it : t_allItems) {
       // calculate W(j, q)
       for (const auto& it2 : t_mapPosWidth.find(it->idx)->second) {
@@ -172,23 +170,16 @@ double StripPacking::solve(
         }
       }
     }
-    model.add(expr <= z);
-    expr.end();
+    model.addConstr(expr <= z);
   }
-  model.add(IloMinimize(env, z));
-  IloCplex cplex(env);
-  cplex.extract(model);
-  cplex.setOut(env.getNullStream());
-  cplex.setWarning(env.getNullStream());
-  // cplex.exportModel("lowerBound5.lp");
+  model.setObjective(GRBLinExpr(z), GRB_MINIMIZE);
+  // model.write("lowerBound5.lp");
 
-  cplex.setParam(IloCplex::Param::Preprocessing::RepeatPresolve, 3);
-  cplex.setParam(IloCplex::Param::Preprocessing::Reduce, 3);
-  cplex.setParam(IloCplex::Param::MIP::Strategy::Probe, 3);
-  cplex.setParam(IloCplex::Param::Preprocessing::Symmetry, 5);
-  cplex.solve();
-  double result = cplex.getObjValue();
-  env.end();
+  model.set(GRB_IntParam_Presolve, 2);   // 2=aggressive (closest to CPLEX RepeatPresolve=3 + Reduce=3)
+  model.set(GRB_IntParam_Probe, 3);      // 3=aggressive probing, MIP only (mirrors CPLEX MIP::Strategy::Probe=3)
+  model.set(GRB_IntParam_Symmetry, 2);   // 2=aggressive, Gurobi max (closest to CPLEX Symmetry=5)
+  model.optimize();
+  double result = model.get(GRB_DoubleAttr_ObjVal);
   return result;
 }
 

@@ -6,6 +6,7 @@
  */
 #include "BLEU.h"
 
+#include "gurobi_c++.h"
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -1031,51 +1032,43 @@ const int StripPacking::BLEU::LowerBound4() const {
     allWidths.push_back(_processedItems[i]->width);
   }
   // model the LP
-  IloEnv env;
-  IloModel NCBP(env);
-  std::map<int, IloRange> allCstrs;
-  // add constraints
-  for (size_t i = 0; i < _processedItems.size(); ++i) {
-    char nameCstr[64];
-    sprintf_s(nameCstr, 64, "Cstr %d", _processedItems[i]->idx);
-    IloExpr expr(env);
-    IloRange cstr(env, _processedItems[i]->height, expr, IloInfinity, nameCstr);
-    allCstrs.insert(std::pair<int, IloRange>(_processedItems[i]->idx, cstr));
-    NCBP.add(cstr);
-    expr.end();
-  }
-  // add the variables and the objective function
-  IloExpr obj(env);
-  for (const auto& i_it : columns) {
-    IloNumColumn col(env);
-    for (const auto& j_it : i_it) {
-      auto ptr = allCstrs.find(j_it);
-      if (ptr != allCstrs.end()) col += ptr->second(1);
-    }
-    char varName[64];
-    sprintf_s(varName, 64, "Var %d", colIdx++);
-    IloNumVar var(col);
-    var.setName(varName);
-    var.setBounds(0, +IloInfinity);
-    NCBP.add(var);
-    col.end();
-    obj += var;
-  }
-  IloObjective realObj = IloMinimize(env, obj);
-  NCBP.add(realObj);
-  obj.end();
   try {
-    IloCplex cplex(NCBP);
-    cplex.setOut(env.getNullStream());
-    cplex.setWarning(env.getNullStream());
+    GRBEnv env(true);
+    env.set(GRB_IntParam_OutputFlag, 0);
+    env.start();
+    GRBModel model(env);
+    std::map<int, GRBConstr> allCstrs;
+    // add constraints: sum(cols containing item i) >= height_i
+    for (size_t i = 0; i < _processedItems.size(); ++i) {
+      char nameCstr[64];
+      sprintf_s(nameCstr, 64, "Cstr %d", _processedItems[i]->idx);
+      GRBConstr cstr = model.addConstr(GRBLinExpr(), GRB_GREATER_EQUAL,
+                                       (double)_processedItems[i]->height,
+                                       nameCstr);
+      allCstrs.insert(std::pair<int, GRBConstr>(_processedItems[i]->idx, cstr));
+    }
+    // add the initial variables (one per item) and the objective function
+    for (const auto& i_it : columns) {
+      GRBColumn col;
+      for (const auto& j_it : i_it) {
+        auto ptr = allCstrs.find(j_it);
+        if (ptr != allCstrs.end()) col.addTerm(1.0, ptr->second);
+      }
+      char varName[64];
+      sprintf_s(varName, 64, "Var %d", colIdx++);
+      model.addVar(0.0, GRB_INFINITY, 1.0, GRB_CONTINUOUS, col, varName);
+    }
+    // use dual simplex: warm-starts well across column generation iterations
+    model.set(GRB_IntParam_Method, 1);
     while (true) {
-      cplex.solve();
-      // cplex.exportModel("NCBP.lp");
+      model.optimize();
+      // model.write("NCBP.lp");
       // solve the pricing problem
-      std::vector<IloNum> dualValues;
+      std::vector<double> dualValues;
       for (size_t i = 0; i < _processedItems.size(); ++i)
         dualValues.push_back(
-            cplex.getDual(allCstrs.find(_processedItems[i]->idx)->second));
+            allCstrs.find(_processedItems[i]->idx)->second.get(
+                GRB_DoubleAttr_Pi));
       std::vector<int> selectedItems;
       double value = dynamicPrg4KnapSack(dualValues, allWidths, _processedW,
                                          selectedItems);
@@ -1085,21 +1078,16 @@ const int StripPacking::BLEU::LowerBound4() const {
         std::set<int> newCol;
         for (const auto& it : selectedItems)
           newCol.insert(_processedItems[it]->idx);
-        IloNumColumn col(env);
+        GRBColumn col;
         for (const auto& it : newCol) {
           auto ptr = allCstrs.find(it);
-          if (ptr != allCstrs.end()) col += ptr->second(1);
+          if (ptr != allCstrs.end()) col.addTerm(1.0, ptr->second);
         }
         char varName[64];
         sprintf_s(varName, 64, "Var %d", colIdx++);
-        IloNumVar var(col);
-        var.setName(varName);
-        var.setBounds(0, +IloInfinity);
-        NCBP.add(var);
-        realObj.setLinearCoef(var, 1.0);
+        model.addVar(0.0, GRB_INFINITY, 1.0, GRB_CONTINUOUS, col, varName);
       } else {
-        double objValue = cplex.getObjValue();
-        env.end();
+        double objValue = model.get(GRB_DoubleAttr_ObjVal);
         double lowerBound;
         std::modf(objValue, &lowerBound);
         if (objValue - lowerBound > BLEU::tolerance)
@@ -1108,11 +1096,10 @@ const int StripPacking::BLEU::LowerBound4() const {
           return lowerBound + _processedH;
       }
     }
-    // add columns
-    // return the solution
-  } catch (IloException& e) {
+  } catch (GRBException& e) {
     std::cout << "NCBP error\n";
-    std::cout << e << std::endl;
+    std::cout << "Error code = " << e.getErrorCode() << "\n";
+    std::cout << e.getMessage() << std::endl;
     return -1;
   }
 }

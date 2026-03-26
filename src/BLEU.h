@@ -5,8 +5,6 @@
  * If you have improvements, please contact me!
  */
 #pragma once
-#include <ilcplex/ilocplex.h>
-
 #include <stack>
 
 #include "spp.h"
